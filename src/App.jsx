@@ -1,15 +1,66 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 
-// ─── Storage helpers (Claude Artifact Storage API) ────────────────────────────
+// ─── Google Sheets integration ───────────────────────────────────────────────
 
-async function loadStorage(key, fallback) {
+const SHEET_URL = "https://script.google.com/macros/s/AKfycbwqIwU9yXSk-7C_MwqSKBNn82Cp5DbrT_7g1z_4Gmz_dqOtBJjOQ2XzRGdDoTDm90ahkQ/exec";
+
+// Legge tutte le sessioni dal foglio e le converte nel formato { "2026-06-13": ["A", "B"] }
+async function fetchCompletions() {
   try {
-    const raw = localStorage.getItem(key);
-    return raw ? JSON.parse(raw) : fallback;
-  } catch { return fallback; }
+    const res = await fetch(SHEET_URL);
+    const json = await res.json();
+    if (!json.success) return {};
+    const result = {};
+    json.data.forEach(row => {
+      if (!row.data || !row.sessione) return;
+      // La data può arrivare come stringa "2026-06-13" o come oggetto Date da Sheets
+      const dateKey = typeof row.data === "string"
+        ? row.data.slice(0, 10)
+        : toDateKey(new Date(row.data));
+      const label = String(row.sessione).trim().toUpperCase();
+      if (!result[dateKey]) result[dateKey] = [];
+      if (!result[dateKey].includes(label)) result[dateKey].push(label);
+    });
+    return result;
+  } catch { return {}; }
 }
 
-async function saveStorage(key, value) {
+// Scrive una riga nel foglio quando si completa una sessione
+async function logSessionToSheet(dateKey, label) {
+  try {
+    await fetch(SHEET_URL, {
+      method: "POST",
+      body: JSON.stringify({ data: dateKey, sessione: label }),
+    });
+  } catch {}
+}
+
+// Elimina tutte le righe di un giorno specifico riscrivendo il foglio
+async function deleteRowsForDay(dateKey) {
+  try {
+    await fetch(SHEET_URL, {
+      method: "POST",
+      body: JSON.stringify({ action: "deleteDay", data: dateKey }),
+    });
+  } catch {}
+}
+
+// Elimina tutte le righe (reset totale)
+async function deleteAllRows() {
+  try {
+    await fetch(SHEET_URL, {
+      method: "POST",
+      body: JSON.stringify({ action: "deleteAll" }),
+    });
+  } catch {}
+}
+
+// ─── localStorage (solo per dati di sessione corrente) ───────────────────────
+
+function loadStorage(key, fallback) {
+  try { const r = localStorage.getItem(key); return r ? JSON.parse(r) : fallback; } catch { return fallback; }
+}
+function saveStorage(key, value) {
   try { localStorage.setItem(key, JSON.stringify(value)); } catch {}
 }
 
@@ -722,18 +773,18 @@ export default function App() {
   // undoStack: array of { checked, setsDone } snapshots (max 10)
   const [undoStack, setUndoStack] = useState([]);
 
-  // Load from Claude Artifact Storage on mount
+  // Carica all'apertura: storico da Google Sheets, resto da localStorage
   useEffect(() => {
     (async () => {
-      const [c, comp, log, sd, wc] = await Promise.all([
-        loadStorage("wk_checked", {}),
-        loadStorage("wk_completions", {}),
-        loadStorage("wk_logged", {}),
-        loadStorage("wk_sets_done", {}),
-        loadStorage("wk_warmup_checked", {}),
+      const [comp, c, log, sd, wc] = await Promise.all([
+        fetchCompletions(),                    // storico dal foglio Google
+        loadStorage("wk_checked", {}),         // esercizi sessione corrente
+        loadStorage("wk_logged", {}),          // data ultimo log per sessione
+        loadStorage("wk_sets_done", {}),       // serie completate
+        loadStorage("wk_warmup_checked", {}),  // riscaldamento
       ]);
-      setChecked(c);
       setCompletions(comp);
+      setChecked(c);
       setLoggedToday(log);
       setSetsDone(sd);
       setWarmupChecked(wc);
@@ -741,9 +792,8 @@ export default function App() {
     })();
   }, []);
 
-  // Persist on change (only after initial load)
+  // Persist dati di sessione in localStorage (non lo storico — quello è su Sheets)
   useEffect(() => { if (ready) saveStorage("wk_checked", checked); }, [checked, ready]);
-  useEffect(() => { if (ready) saveStorage("wk_completions", completions); }, [completions, ready]);
   useEffect(() => { if (ready) saveStorage("wk_logged", loggedToday); }, [loggedToday, ready]);
   useEffect(() => { if (ready) saveStorage("wk_sets_done", setsDone); }, [setsDone, ready]);
   useEffect(() => { if (ready) saveStorage("wk_warmup_checked", warmupChecked); }, [warmupChecked, ready]);
@@ -785,24 +835,25 @@ export default function App() {
     setUndoStack(prev => prev.slice(0, -1));
   };
 
-  // Auto-log completion + auto-reset exercises after logging
+  // Auto-log completion + scrivi su Google Sheets + reset esercizi
   useEffect(() => {
     if (!ready) return;
     const todayKey = toDateKey(new Date());
     Object.values(workouts).forEach(w => {
-      // every() returns true on empty arrays — guard with explicit length check
       const donCount = w.exercises.filter(ex => checked[ex.id]).length;
       const allDone = donCount === w.exercises.length && donCount > 0;
       if (allDone && loggedToday[w.label] !== todayKey) {
-        // 1. Add dot to calendar
+        // 1. Aggiorna il calendario localmente (UI immediata)
         setCompletions(prev => {
           const existing = prev[todayKey] || [];
           if (existing.includes(w.label)) return prev;
           return { ...prev, [todayKey]: [...existing, w.label] };
         });
-        // 2. Mark as logged today
+        // 2. Scrivi su Google Sheets (asincrono, non blocca)
+        logSessionToSheet(todayKey, w.label);
+        // 3. Segna come loggato oggi
         setLoggedToday(prev => ({ ...prev, [w.label]: todayKey }));
-        // 3. Auto-reset exercises + warmup so the card is clean for next session
+        // 4. Reset esercizi dopo 1.8s (l'utente vede 100% prima del reset)
         const ids = w.exercises.map(e => e.id);
         const wids = warmups[w.label].steps.map(s => s.id);
         setTimeout(() => {
@@ -810,7 +861,7 @@ export default function App() {
           setSetsDone(prev => { const next = { ...prev }; ids.forEach(id => delete next[id]); return next; });
           setWarmupChecked(prev => { const next = { ...prev }; wids.forEach(id => delete next[id]); return next; });
           setWarmupDone(prev => { const next = { ...prev }; delete next[w.label]; return next; });
-        }, 1800); // small delay so the user sees 100% before reset
+        }, 1800);
       }
     });
   }, [checked, ready]);
@@ -826,19 +877,15 @@ export default function App() {
     setUndoStack([]);
   };
 
-  // Reset a single day's dot from the calendar
+  // Reset un giorno specifico: rimuove dal calendario e dal foglio Google
   const resetDay = (dateKey) => {
-    setCompletions(prev => {
-      const next = { ...prev };
-      delete next[dateKey];
-      return next;
-    });
-    // Also clear loggedToday entries for that day so session can be re-logged
+    setCompletions(prev => { const next = { ...prev }; delete next[dateKey]; return next; });
     setLoggedToday(prev => {
       const next = { ...prev };
       Object.keys(next).forEach(label => { if (next[label] === dateKey) delete next[label]; });
       return next;
     });
+    deleteRowsForDay(dateKey); // elimina dal foglio Google
     setSelectedDay(null);
   };
 
@@ -850,13 +897,11 @@ export default function App() {
     setWarmupChecked({});
     setWarmupDone({});
     setSelectedDay(null);
-    await Promise.all([
-      saveStorage("wk_checked", {}),
-      saveStorage("wk_completions", {}),
-      saveStorage("wk_logged", {}),
-      saveStorage("wk_sets_done", {}),
-      saveStorage("wk_warmup_checked", {}),
-    ]);
+    setUndoStack([]);
+    // Pulisce localStorage
+    ["wk_checked", "wk_logged", "wk_sets_done", "wk_warmup_checked"].forEach(k => saveStorage(k, {}));
+    // Pulisce Google Sheets
+    await deleteAllRows();
     setConfirmReset(false);
   };
 
